@@ -2,11 +2,6 @@
 #
 # Codex usage harvester.
 #
-# Codex CLI has no statusLine hook, so unlike Claude nothing pushes usage at us.
-# What it does have is a rollout log per session under $CODEX_HOME/sessions,
-# where every `token_count` event carries the server's `rate_limits` block. We
-# read the newest of those and cache the weekly window for the tmux segment.
-#
 # Prints nothing. Cheap enough to call on redraw thanks to the TTL below, but
 # segment.sh still backgrounds it so a slow disk never stalls the status line.
 
@@ -90,7 +85,7 @@ files="$(
 
 [ -n "$files" ] || exit 0
 
-best_pct="" best_reset=-1
+best_vals=""
 
 while IFS= read -r f; do
 	[ -n "$f" ] || continue
@@ -100,44 +95,29 @@ while IFS= read -r f; do
 	line="$(reverse_cat "$f" 2>/dev/null | grep -m1 '"rate_limits"')"
 	[ -n "$line" ] || continue
 
-	# Codex splits usage across `primary` and `secondary` windows, and which one
-	# is the weekly budget depends on the plan — on Plus the weekly window shows
-	# up as `primary` with no secondary at all. So select by window length
-	# instead of by field name: anything a day or longer is the weekly budget.
-	# If a plan only reports a short window, we emit nothing rather than
-	# mislabelling a 5-hour figure as weekly.
 	vals="$(printf '%s' "$line" | "$JQ" -r '
 		.payload.rate_limits as $r
 		| [$r.primary, $r.secondary]
-		| map(select(. != null and .window_minutes != null and .window_minutes >= 1440))
-		| (max_by(.window_minutes) // empty)
-		| "\(.used_percent // "")|\(.resets_at // "")"
+		| map(select(type == "object")
+			| select((.window_minutes | type) == "number" and (.used_percent | type) == "number")
+			| select(.window_minutes > 0 and .used_percent >= 0 and .used_percent <= 100)
+			| .resets_at = (.resets_at | if type == "number" then if . >= 0 and . == floor then . else null end else null end)) as $windows
+		| ($windows | map(select(.window_minutes < 1440)) | min_by(.window_minutes)) as $current
+		| ($windows | map(select(.window_minutes >= 1440)) | max_by(.window_minutes)) as $weekly
+		| select($current != null or $weekly != null)
+		| "CODEX_CURRENT_PCT=\($current.used_percent // "")\nCODEX_CURRENT_RESET=\($current.resets_at // "")\nCODEX_WEEK_PCT=\($weekly.used_percent // "")\nCODEX_WEEK_RESET=\($weekly.resets_at // "")"
 	' 2>/dev/null)" || continue
-
-	pct="${vals%%|*}"
-	reset="${vals##*|}"
-	[ -n "$pct" ] || continue
-	[[ "$reset" =~ ^[0-9]+$ ]] || reset=0
-
-	# Same freshness rule as the Claude harvester: a later window always wins,
-	# and within one window the higher percentage is the more recent reading,
-	# since usage only climbs until the window resets.
-	if ((reset > best_reset)); then
-		best_reset="$reset"
-		best_pct="$pct"
-	elif ((reset == best_reset)) && [ -n "$best_pct" ] &&
-		awk -v a="$pct" -v b="$best_pct" 'BEGIN { exit !(a + 0 > b + 0) }'; then
-		best_pct="$pct"
-	fi
+	[ -n "$vals" ] || continue
+	best_vals="$vals"
+	break
 done <<EOF
 $files
 EOF
 
-[ -n "$best_pct" ] || exit 0
+[ -n "$best_vals" ] || exit 0
 
 {
-	printf 'CODEX_WEEK_PCT=%s\n' "$best_pct"
-	printf 'CODEX_WEEK_RESET=%s\n' "$best_reset"
+	printf '%s\n' "$best_vals"
 	printf 'UPDATED_AT=%s\n' "$now"
 } >"$CACHE_FILE.tmp.$$" 2>/dev/null && mv "$CACHE_FILE.tmp.$$" "$CACHE_FILE" 2>/dev/null
 

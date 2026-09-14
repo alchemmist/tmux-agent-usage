@@ -24,7 +24,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$DIR/helpers.sh"
 
 # Options
-show="$(get_tmux_option @claude_usage_show session)" # session | weekly | all
+show="$(get_tmux_option @claude_usage_claude_show "$(get_tmux_option @claude_usage_show session)")"
+claude_default=on
+[ "$(get_tmux_option @claude_usage_codex_only off)" = on ] && claude_default=off
+claude="$(get_tmux_option @claude_usage_claude "$claude_default")"
 style="$(get_tmux_option @claude_usage_style bar)"   # bar | gauge
 bar_width="$(get_tmux_option @claude_usage_bar_width 10)"
 bar_full="$(get_tmux_option @claude_usage_bar_full '█')"
@@ -50,8 +53,10 @@ weekly_icon="$(get_tmux_option @claude_usage_weekly_icon "$icon")"
 # an option set to "" and an option never set the same way.
 label_color="$(get_tmux_option @claude_usage_label_color "$(get_tmux_option @claude_usage_color_normal '')")"
 [ "$label_color" = none ] && label_color=""
-codex="$(get_tmux_option @claude_usage_codex off)" # off | on — show Codex weekly
+codex="$(get_tmux_option @claude_usage_codex off)"
+codex_show="$(get_tmux_option @claude_usage_codex_show weekly)"
 codex_icon="$(get_tmux_option @claude_usage_codex_icon '')"
+codex_weekly_icon="$(get_tmux_option @claude_usage_codex_weekly_icon "$codex_icon")"
 
 now="$(date +%s)"
 
@@ -64,7 +69,7 @@ fi
 
 # Load harvested values without sourcing (no code execution from cache files).
 five_pct="" five_reset="" seven_pct="" seven_reset="" updated_at=""
-codex_pct="" codex_reset=""
+codex_pct="" codex_reset="" codex_current_pct="" codex_current_reset=""
 
 read_cache() {
 	local file="$1" key val
@@ -75,6 +80,8 @@ read_cache() {
 		FIVE_HOUR_RESET) five_reset="$val" ;;
 		SEVEN_DAY_PCT) seven_pct="$val" ;;
 		SEVEN_DAY_RESET) seven_reset="$val" ;;
+		CODEX_CURRENT_PCT) codex_current_pct="$val" ;;
+		CODEX_CURRENT_RESET) codex_current_reset="$val" ;;
 		CODEX_WEEK_PCT) codex_pct="$val" ;;
 		CODEX_WEEK_RESET) codex_reset="$val" ;;
 		UPDATED_AT) updated_at="$val" ;;
@@ -84,7 +91,7 @@ read_cache() {
 
 # Claude first, so its UPDATED_AT is the one the staleness marker reports —
 # that marker documents the harvester, which only Claude has.
-read_cache "$(usage_cache_file)"
+[ "$claude" = on ] && read_cache "$(usage_cache_file)"
 claude_updated_at="$updated_at"
 [ "$codex" = on ] && read_cache "$(codex_cache_file)"
 updated_at="$claude_updated_at"
@@ -172,23 +179,35 @@ window_segment() {
 }
 
 segments=()
-case "$show" in
-weekly)
-	s="$(window_segment "$seven_pct" "$seven_reset" "$weekly_label" "$weekly_icon")" && segments+=("$s")
-	;;
-all)
-	s="$(window_segment "$five_pct" "$five_reset" "$session_label" "$icon")" && segments+=("$s")
-	s="$(window_segment "$seven_pct" "$seven_reset" "$weekly_label" "$weekly_icon")" && segments+=("$s")
-	;;
-*)
-	s="$(window_segment "$five_pct" "$five_reset" "$session_label" "$icon")" && segments+=("$s")
-	;;
-esac
+if [ "$claude" = on ]; then
+	case "$show" in
+	weekly)
+		s="$(window_segment "$seven_pct" "$seven_reset" "$weekly_label" "$weekly_icon")" && segments+=("$s")
+		;;
+	all)
+		s="$(window_segment "$five_pct" "$five_reset" "$session_label" "$icon")" && segments+=("$s")
+		s="$(window_segment "$seven_pct" "$seven_reset" "$weekly_label" "$weekly_icon")" && segments+=("$s")
+		;;
+	*)
+		s="$(window_segment "$five_pct" "$five_reset" "$session_label" "$icon")" && segments+=("$s")
+		;;
+	esac
+fi
 
-# Codex reports only a weekly budget on the plans that expose rate_limits at
-# all, so there is no window to choose between here.
 if [ "$codex" = on ]; then
-	s="$(window_segment "$codex_pct" "$codex_reset" "$weekly_label" "$codex_icon")" && segments+=("$s")
+	show="$codex_show"
+	case "$codex_show" in
+	current|session)
+		s="$(window_segment "$codex_current_pct" "$codex_current_reset" "$session_label" "$codex_icon")" && segments+=("$s")
+		;;
+	all)
+		s="$(window_segment "$codex_current_pct" "$codex_current_reset" "$session_label" "$codex_icon")" && segments+=("$s")
+		s="$(window_segment "$codex_pct" "$codex_reset" "$weekly_label" "$codex_weekly_icon")" && segments+=("$s")
+		;;
+	*)
+		s="$(window_segment "$codex_pct" "$codex_reset" "$weekly_label" "$codex_weekly_icon")" && segments+=("$s")
+		;;
+	esac
 fi
 
 ((${#segments[@]})) || exit 0
