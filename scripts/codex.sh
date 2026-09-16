@@ -30,7 +30,7 @@ now="$(date +%s)"
 
 # Serve from cache while it's fresh. Read the timestamp without sourcing the
 # file, matching how segment.sh treats the Claude cache.
-if [ -f "$CACHE_FILE" ]; then
+if [ "${1:-}" != --force ] && [ -f "$CACHE_FILE" ]; then
 	cached_at="$(sed -n 's/^UPDATED_AT=//p' "$CACHE_FILE" 2>/dev/null)"
 	if [[ "$cached_at" =~ ^[0-9]+$ ]] && ((now - cached_at < TTL)); then
 		exit 0
@@ -89,14 +89,10 @@ best_vals=""
 
 while IFS= read -r f; do
 	[ -n "$f" ] || continue
-	# No `|| continue` on the assignment: grep -m1 exits as soon as it matches,
-	# which SIGPIPEs the reverse reader and — under `pipefail` — fails the whole
-	# pipeline on the very success case we want. Judge by the output instead.
-	line="$(reverse_cat "$f" 2>/dev/null | grep -m1 '"rate_limits"')"
-	[ -n "$line" ] || continue
-
-	vals="$(printf '%s' "$line" | "$JQ" -r '
-		.payload.rate_limits as $r
+	vals="$(reverse_cat "$f" 2>/dev/null | "$JQ" -nr '
+		first(inputs | .payload.rate_limits
+		| select(type == "object")
+		| select(.limit_id == null or .limit_id == "codex") as $r
 		| [$r.primary, $r.secondary]
 		| map(select(type == "object")
 			| select((.window_minutes | type) == "number" and (.used_percent | type) == "number")
@@ -105,14 +101,12 @@ while IFS= read -r f; do
 		| ($windows | map(select(.window_minutes < 1440)) | min_by(.window_minutes)) as $current
 		| ($windows | map(select(.window_minutes >= 1440)) | max_by(.window_minutes)) as $weekly
 		| select($current != null or $weekly != null)
-		| "CODEX_CURRENT_PCT=\($current.used_percent // "")\nCODEX_CURRENT_RESET=\($current.resets_at // "")\nCODEX_WEEK_PCT=\($weekly.used_percent // "")\nCODEX_WEEK_RESET=\($weekly.resets_at // "")"
-	' 2>/dev/null)" || continue
+		| "CODEX_CURRENT_PCT=\($current.used_percent // "")\nCODEX_CURRENT_RESET=\($current.resets_at // "")\nCODEX_WEEK_PCT=\($weekly.used_percent // "")\nCODEX_WEEK_RESET=\($weekly.resets_at // "")")
+	' 2>/dev/null)"
 	[ -n "$vals" ] || continue
 	best_vals="$vals"
 	break
-done <<EOF
-$files
-EOF
+done < <(printf '%s\n' "$files")
 
 [ -n "$best_vals" ] || exit 0
 

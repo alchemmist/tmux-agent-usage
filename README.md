@@ -44,7 +44,7 @@ set -g status-interval 5
 run-shell ~/.tmux/plugins/tmux-claude-usage/claude-usage.tmux
 ```
 
-Reload with `tmux source-file ~/.tmux.conf`, then use Claude Code and Codex normally to populate the readings. Claude updates when its status line renders; Codex checks the most recently modified sessions and caches the reported windows for 60 seconds. Missing windows stay hidden.
+Reload with `tmux source-file ~/.tmux.conf`, then use Claude Code and Codex normally to populate the readings. Claude updates when its status line renders; Codex checks the most recently modified sessions and caches the reported windows for 60 seconds. It selects the standard Codex limit and skips separate model budgets such as Spark. Reloading the tmux config forces a fresh Codex scan, bypassing the 60-second cache. Missing windows stay hidden.
 
 Using **TPM**? Replace the `run-shell` line with `set -g @plugin 'alchemmist/tmux-claude-usage'`, keep TPM initialization last, and press `prefix + I`. Run `scripts/init.sh` once after installation.
 

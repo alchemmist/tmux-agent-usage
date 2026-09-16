@@ -87,6 +87,36 @@ class UsageTest(unittest.TestCase):
         cache = self.cache / 'codex'
         return dict(line.split('=', 1) for line in cache.read_text().splitlines()) if cache.exists() else {}
 
+    def test_codex_skips_spark_and_empty_events(self):
+        events = [
+            {'payload': {'rate_limits': {'limit_id': 'codex', 'primary': {'window_minutes': 10080, 'used_percent': 90}}}},
+            {'payload': {'rate_limits': {'limit_id': 'codex_bengalfox', 'primary': {'window_minutes': 10080, 'used_percent': 0}}}},
+            {'payload': {'rate_limits': None}},
+        ]
+        (self.sessions / 'rollout-mixed.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events))
+        subprocess.run(['bash', str(self.root / 'codex.sh')], env=self.env, check=True, timeout=5)
+        cache = dict(line.split('=', 1) for line in (self.cache / 'codex').read_text().splitlines())
+        self.assertEqual(cache['CODEX_WEEK_PCT'], '90')
+
+    def test_refresh_with_long_session_paths_finishes(self):
+        folder = self.sessions / ('a' * 180) / ('b' * 180) / ('c' * 180)
+        folder.mkdir(parents=True)
+        event = {'payload': {'rate_limits': {'limit_id': 'codex', 'primary': {'window_minutes': 10080, 'used_percent': 90}}}}
+        for index in range(5):
+            (folder / ('rollout-' + str(index) + '-' + 'd' * 170 + '.jsonl')).write_text(json.dumps(event) + '\n')
+        subprocess.run(['bash', str(self.root / 'codex.sh')], env=self.env, check=True, timeout=5)
+        self.assertIn('CODEX_WEEK_PCT=90', (self.cache / 'codex').read_text())
+
+    def test_force_refresh_bypasses_fresh_cache(self):
+        self.harvest({'primary': {'window_minutes': 10080, 'used_percent': 46}})
+        event = {'payload': {'rate_limits': {'primary': {'window_minutes': 10080, 'used_percent': 90}}}}
+        (self.sessions / 'rollout-new.jsonl').write_text(json.dumps(event) + '\n')
+        command = ['bash', str(self.root / 'codex.sh')]
+        subprocess.run(command, env=self.env, check=True, timeout=5)
+        self.assertIn('CODEX_WEEK_PCT=46', (self.cache / 'codex').read_text())
+        subprocess.run(command + ['--force'], env=self.env, check=True, timeout=5)
+        self.assertIn('CODEX_WEEK_PCT=90', (self.cache / 'codex').read_text())
+
     def test_codex_window_selection(self):
         short = {'window_minutes': 300, 'used_percent': 33, 'resets_at': self.now + 3600}
         week = {'window_minutes': 10080, 'used_percent': 44, 'resets_at': self.now + 86400}
