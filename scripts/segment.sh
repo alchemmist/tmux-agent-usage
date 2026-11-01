@@ -58,6 +58,8 @@ codex_show="$(get_tmux_option @claude_usage_codex_show weekly)"
 codex_icon="$(get_tmux_option @claude_usage_codex_icon '')"
 codex_weekly_icon="$(get_tmux_option @claude_usage_codex_weekly_icon "$codex_icon")"
 
+providers="$(get_tmux_option @agent_usage_providers '')"
+[ -n "$providers" ] && { claude=off; codex=off; }
 now="$(date +%s)"
 
 # Kick off a Codex refresh before rendering. Backgrounded and detached: the
@@ -177,6 +179,11 @@ window_segment() {
 	# `return 1` paths above (missing data) stay non-zero on purpose.
 	return 0
 }
+
+if [ -n "$providers" ]; then
+	source "$DIR/subscriptions.sh"
+	exit 0
+fi
 
 segments=()
 if [ "$claude" = on ]; then

@@ -27,7 +27,7 @@ main() {
 	chmod +x "$CURRENT_DIR"/scripts/*.sh 2>/dev/null
 	interpolate_option "status-right"
 	interpolate_option "status-left"
-	if [ "$(get_tmux_option @claude_usage_codex)" = on ]; then
+	if [ -z "$(get_tmux_option @agent_usage_providers)" ] && [ "$(get_tmux_option @claude_usage_codex)" = on ]; then
 		"$CURRENT_DIR/scripts/codex.sh" --force
 	fi
 	tmux refresh-client -S 2>/dev/null || true
