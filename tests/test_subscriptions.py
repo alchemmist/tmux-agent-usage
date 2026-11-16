@@ -36,6 +36,12 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(values['PCT'], 0.36)
         self.assertEqual(values['RESET'], 1796083200)
 
+    def test_cursor_dashboard_period_is_millis(self):
+        values = MODULE.parse_cursor({'planUsage': {'totalPercentUsed': 2.512},
+                                     'billingCycleEnd': '1793636515351'})
+        self.assertEqual(values['PCT'], 2.512)
+        self.assertEqual(values['RESET'], 1793636515)
+
     def test_cursor_fallback_and_no_fabricated_zero(self):
         self.assertEqual(MODULE.parse_cursor({'individualUsage': {'plan': {'used': 40, 'limit': 200}}})['PCT'], 20)
         for data in ({}, {'individualUsage': {'plan': {'totalPercentUsed': True}}},
@@ -60,27 +66,29 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(current['UPDATED_AT'], original['UPDATED_AT'])
             self.assertEqual(current['STATUS'], 'network')
 
-    def test_expired_auth_refresh_uses_official_client_protocol(self):
+    def test_expired_pi_auth_refreshes_and_auth_failure_drops_old_account(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            binary = home / '.local/bin/antex'
-            binary.parent.mkdir(parents=True)
-            binary.write_text(f'#!{sys.executable}\nimport sys,json,time\n'
-                              'for line in sys.stdin:\n'
-                              ' message=json.loads(line)\n'
-                              ' if message.get("id")==2:\n'
-                              '  assert message["method"]=="account/read"\n'
-                              '  assert message["params"]["refreshToken"] is True\n'
-                              '  print(json.dumps({"id":2,"result":{}}),flush=True)\n'
-                              '  time.sleep(30)\n')
-            binary.chmod(0o755)
-            with patch.object(MODULE.shutil, 'which', return_value=None):
-                MODULE.refresh_chatgpt_auth(home)
+            auth = home / '.pi/agent/auth.json'
+            auth.parent.mkdir(parents=True)
+            auth.write_text(json.dumps({'openai': {'access': 'old', 'refresh': 'r', 'clientId': 'c', 'expires': 0}}))
+            with patch.object(MODULE, 'request', return_value={'access_token': 'new', 'refresh_token': 'r2', 'expires_in': 3600}):
+                cred = MODULE.refresh_pi_openai(home)
+            self.assertEqual(cred['access'], 'new')
+            self.assertEqual(json.loads(auth.read_text())['openai']['refresh'], 'r2')
+            cache = home / 'cache'
+            cache.mkdir()
+            (cache / 'chatgpt').write_text('WEEK_PCT=0\nWEEK_RESET=200\nSTATUS=ok\nUPDATED_AT=1\n')
+            with patch.object(MODULE, 'fetch_chatgpt', side_effect=MODULE.UsageError('auth')):
+                MODULE.refresh('chatgpt', home, cache, 60, True, '')
+            current = MODULE.read_cache(cache / 'chatgpt')
+            self.assertEqual(current['STATUS'], 'auth')
+            self.assertNotIn('WEEK_PCT', current)
 
     def test_credentials_not_in_command_arguments(self):
         result = subprocess.CompletedProcess([], 0, '{}\n200', '')
         with patch.object(MODULE.subprocess, 'run', return_value=result) as run:
-            MODULE.request('https://cursor.com/api/usage-summary', ['Cookie: secret'])
+            MODULE.request('https://cursor.com/api/dashboard/get-current-period-usage', ['Cookie: secret'], body='{}')
         self.assertNotIn('secret', str(run.call_args.args))
         self.assertIn('secret', run.call_args.kwargs['input'])
 

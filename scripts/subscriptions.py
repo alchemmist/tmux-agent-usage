@@ -9,10 +9,9 @@ import math
 import os
 from pathlib import Path
 import re
-import selectors
-import shutil
 import subprocess
 import time
+import urllib.parse
 
 
 class UsageError(Exception):
@@ -30,7 +29,11 @@ def percentage(value):
 
 
 def epoch(value):
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
     if number(value) and value > 0:
+        if value > 10**12:
+            value /= 1000
         return int(value)
     if isinstance(value, str):
         try:
@@ -59,14 +62,17 @@ def parse_chatgpt(data):
 
 
 def parse_cursor(data):
-    plan = (data.get('individualUsage') or {}).get('plan') or {}
+    plan = data.get('planUsage') or (data.get('individualUsage') or {}).get('plan') or {}
     pct = plan.get('totalPercentUsed')
     if pct is None:
         used, limit = plan.get('used'), plan.get('limit')
         if not number(used) or not number(limit) or limit <= 0:
             raise UsageError('missing_usage')
         pct = used / limit * 100
-    return {'PCT': percentage(pct), 'RESET': epoch(data.get('billingCycleEnd'))}
+    reset = data.get('billingCycleEnd')
+    if reset in (None, ''):
+        reset = (data.get('planInfo') or {}).get('includedUsageResetsAt')
+    return {'PCT': percentage(pct), 'RESET': epoch(reset)}
 
 
 def claims(token):
@@ -83,8 +89,11 @@ def load_json(path):
         return {}
 
 
-def request(url, headers, resolve=''):
-    args = ['curl', '--silent', '--show-error', '--fail', '--connect-timeout', '5', '--max-time', '15', '--max-filesize', '1048576', '--header', '@-', '--write-out', '\n%{http_code}', url]
+def request(url, headers, resolve='', body=None):
+    args = ['curl', '--silent', '--show-error', '--fail', '--connect-timeout', '5', '--max-time', '15', '--max-filesize', '1048576', '--header', '@-', '--write-out', '\n%{http_code}']
+    if body is not None:
+        args += ['--request', 'POST', '--data', body]
+    args.append(url)
     if resolve:
         args += ['--resolve', resolve]
     try:
@@ -103,81 +112,59 @@ def request(url, headers, resolve=''):
     return data
 
 
-def refresh_chatgpt_auth(home):
-    binary = shutil.which('antex') or str(home / '.local/bin/antex')
-    if not Path(binary).is_file():
+def pi_auth_path(home):
+    return home / '.pi/agent/auth.json'
+
+
+def refresh_pi_openai(home):
+    path = pi_auth_path(home)
+    data = load_json(path)
+    cred = data.get('openai') or {}
+    client_id, refresh_token = cred.get('clientId'), cred.get('refresh')
+    if not client_id or not refresh_token:
         raise UsageError('auth')
-    environment = dict(os.environ, ANTEX_HOME=str(os.environ.get('CODEX_HOME', home / '.antex')))
-    process = subprocess.Popen([binary, 'app-server', '--stdio'], stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    try:
-        messages = [
-            {'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'tmux-agent-usage', 'version': '1.0'}}},
-            {'method': 'initialized', 'params': {}},
-            {'id': 2, 'method': 'account/read', 'params': {'refreshToken': True}},
-        ]
-        process.stdin.write(('\n'.join(json.dumps(message) for message in messages) + '\n').encode())
-        process.stdin.flush()
-        deadline = time.monotonic() + 20
-        pending = b''
-        while time.monotonic() < deadline:
-            if not selector.select(max(0, deadline - time.monotonic())):
-                break
-            chunk = os.read(process.stdout.fileno(), 65536)
-            if not chunk:
-                break
-            pending += chunk
-            while b'\n' in pending:
-                line, pending = pending.split(b'\n', 1)
-                response = json.loads(line)
-                if response.get('id') == 2:
-                    if 'error' in response:
-                        raise UsageError('auth')
-                    return
+    body = urllib.parse.urlencode({
+        'grant_type': 'refresh_token',
+        'client_id': client_id,
+        'refresh_token': refresh_token,
+        'resource': 'https://api.openai.com/v1',
+    })
+    token = request('https://auth.openai.com/api/accounts/oauth/token',
+                    ['Content-Type: application/x-www-form-urlencoded', 'Accept: application/json'], body=body)
+    access, refresh = token.get('access_token'), token.get('refresh_token')
+    expires_in = token.get('expires_in')
+    if not isinstance(access, str) or not isinstance(refresh, str) or not number(expires_in):
         raise UsageError('auth')
-    finally:
-        selector.close()
-        process.stdin.close()
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        process.stdout.close()
+    cred['access'] = access
+    cred['refresh'] = refresh
+    cred['expires'] = int(time.time() * 1000 + expires_in * 1000 - 180000)
+    cred['type'] = cred.get('type') or 'oauth'
+    data['openai'] = cred
+    temp = path.with_name(path.name + '.' + str(os.getpid()) + '.tmp')
+    temp.write_text(json.dumps(data))
+    temp.chmod(0o600)
+    temp.replace(path)
+    return cred
 
 
 def fetch_chatgpt(home):
-    paths = [Path(os.environ.get('CODEX_HOME', home / '.antex')) / 'auth.json', home / '.codex/auth.json']
-    credentials = []
-    for path in dict.fromkeys(paths):
-        tokens = load_json(path).get('tokens') or {}
-        if tokens.get('access_token'):
-            token_claims = claims(tokens['access_token'])
-            if path.parent == Path(os.environ.get('CODEX_HOME', home / '.antex')) and token_claims.get('exp', 0) <= time.time() + 60:
-                refresh_chatgpt_auth(home)
-                tokens = load_json(path).get('tokens') or {}
-            if tokens.get('access_token'):
-                credentials.append((tokens['access_token'], tokens.get('account_id')))
-    pi = load_json(home / '.pi/agent/auth.json').get('openai') or {}
-    if pi.get('access'):
-        token = pi['access']
-        account = claims(token).get('https://api.openai.com/auth', {}).get('chatgpt_account_id')
-        credentials.append((token, account))
-    error = UsageError('missing_auth')
-    for token, account in credentials:
-        headers = ['Authorization: Bearer ' + token]
-        if account:
-            headers.append('ChatGPT-Account-Id: ' + account)
-        try:
-            return parse_chatgpt(request('https://chatgpt.com/backend-api/wham/usage', headers))
-        except UsageError as exc:
-            error = exc
-            if str(exc) != 'auth':
-                break
-    raise error
+    path = pi_auth_path(home)
+    data = load_json(path)
+    cred = data.get('openai-codex') or data.get('openai') or {}
+    token = cred.get('access')
+    if not token:
+        raise UsageError('missing_auth')
+    expires = cred.get('expires')
+    if data.get('openai-codex') is None and number(expires) and expires <= (time.time() + 60) * 1000:
+        cred = refresh_pi_openai(home)
+        token = cred.get('access')
+    if not token:
+        raise UsageError('auth')
+    account = cred.get('accountId') or claims(token).get('https://api.openai.com/auth', {}).get('chatgpt_account_id')
+    headers = ['Authorization: Bearer ' + token]
+    if account:
+        headers.append('ChatGPT-Account-Id: ' + account)
+    return parse_chatgpt(request('https://chatgpt.com/backend-api/wham/usage', headers))
 
 
 def fetch_cursor(home, resolve):
@@ -189,7 +176,8 @@ def fetch_cursor(home, resolve):
     if not re.fullmatch(r'[A-Za-z0-9._-]+', subject):
         raise UsageError('invalid_auth')
     cookie = 'Cookie: WorkosCursorSessionToken=' + subject + '%3A%3A' + token
-    return parse_cursor(request('https://cursor.com/api/usage-summary', [cookie], resolve))
+    headers = [cookie, 'Origin: https://cursor.com', 'Content-Type: application/json']
+    return parse_cursor(request('https://cursor.com/api/dashboard/get-current-period-usage', headers, resolve, '{}'))
 
 
 def read_cache(path):
@@ -216,6 +204,10 @@ def refresh(provider, home, cache, ttl, force, resolve):
             values.update(UPDATED_AT=now, STATUS='ok')
         except UsageError as exc:
             values = dict(old, STATUS=str(exc))
+            if provider == 'chatgpt' and str(exc) in ('auth', 'missing_auth'):
+                for key in list(values):
+                    if key.endswith('_PCT') or key.endswith('_RESET'):
+                        values.pop(key)
         except (OSError, ValueError, TypeError, AttributeError):
             values = dict(old, STATUS='invalid_response')
         values['ATTEMPT_AT'] = now
